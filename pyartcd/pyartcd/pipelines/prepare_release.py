@@ -823,6 +823,9 @@ async def prepare_release(runtime: Runtime, group: str, assembly: str, name: Opt
         jira_token = os.environ.get("JIRA_TOKEN")
         if not runtime.dry_run and not jira_token:
             raise ValueError("JIRA_TOKEN environment variable is not set")
+        # validate jira_token to prevent snyk issues
+        if not re.match(r"^\w+$", jira_token):
+            raise ValueError("JIRA_TOKEN environment variable is not valid")
         # start pipeline
         pipeline = PrepareReleasePipeline(
             slack_client=slack_client,
