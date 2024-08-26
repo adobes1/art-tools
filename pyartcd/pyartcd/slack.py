@@ -42,6 +42,16 @@ class SlackClient:
         else:
             raise ValueError(f"Invalid channel_or_release value: {channel_or_release}")
 
+    async def get_channel_id(self):
+        """
+        Get channel_id of the currently bound channel
+        """
+        # Can only get private channel ids for now to avoid longer waiting caused by request ratelimit
+        response = await self._client.conversations_list(types="private_channel", limit=999)
+        for channel in response.data["channels"]:
+            if channel["name"] == self.channel.strip("#"):
+                return channel["id"]
+
     async def say_in_thread(self, message: str, reaction: Optional[str] = None):
         if not self._thread_ts:
             response_data = await self.say(message, thread_ts=None, reaction=reaction)
@@ -110,4 +120,26 @@ class SlackClient:
             filename=filename,
             filetype=filetype,
             thread_ts=thread_ts)
+        return response.data
+
+    async def delete_message(self, message_ts: str):
+        channel_id = await self.get_channel_id()
+        response = await self._client.chat_delete(
+            ts=message_ts,
+            channel=channel_id,
+            as_user=self.as_user)
+        return response.data
+
+    async def list_messages(self, limit: int = 999):
+        channel_id = await self.get_channel_id()
+        response = await self._client.conversations_history(
+            channel=channel_id,
+            limit=limit)
+        return response.data
+
+    async def list_replies(self, thread_ts: str):
+        channel_id = await self.get_channel_id()
+        response = await self._client.conversations_replies(
+            channel=channel_id,
+            ts=thread_ts)
         return response.data
