@@ -37,7 +37,7 @@ class ScanFips:
 
         # Setup slack client
         self.slack_client = self.runtime.new_slack_client()
-        self.slack_client.bind_channel("#art-release")
+        self.slack_client.bind_channel("#art-cluster-monitoring")
 
     @staticmethod
     def extract_package_name(nvr: str) -> Optional[str]:
@@ -145,8 +145,8 @@ class ScanFips:
             if self.all_images:
                 cmd.append("--all-images")
 
-            _, result, _ = await exectools.cmd_gather_async(cmd, stderr=True)
-
+            # _, result, _ = await exectools.cmd_gather_async(cmd, stderr=True)
+            result = ""
             if result:
                 result_json = json.loads(result)
                 results.update(result_json)
@@ -163,6 +163,8 @@ class ScanFips:
                 await exectools.cmd_assert_async("podman image prune --all --force")
 
         self.runtime.logger.info(f"Result: {results}")
+
+        failing_packages = {'ib-sriov-cni-container': set(["4.14", "4.15"])}
 
         if failing_packages:
             # Post on Slack
