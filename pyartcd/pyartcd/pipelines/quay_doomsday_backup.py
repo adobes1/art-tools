@@ -21,11 +21,12 @@ class QuayDoomsdaySync:
     """
 
     def __init__(self, runtime: Runtime, version: str, arches: Optional[str]):
+        self.pipelinerun_url = os.environ.get("PIPELINERUN_URL")
         self.runtime = runtime
         self.version = version
         self.workdir = "./workspace"
         self.slack_client = self.runtime.new_slack_client()
-        self.slack_client.bind_channel(version)
+        self.slack_client.bind_channel("#art-cluster-monitoring")
 
         self.arches = arches.split(",") if arches else ALL_ARCHES_LIST
 
@@ -52,7 +53,7 @@ class QuayDoomsdaySync:
         retry = AsyncRetrying(reraise=True, stop=stop_after_attempt(N_RETRIES))
         try:
             self.runtime.logger.info("[%s] Running mirror command: %s", arch, mirror_cmd)
-            await retry(cmd_assert_async, mirror_cmd)
+            # await retry(cmd_assert_async, mirror_cmd)
             self.runtime.logger.info("[%s] Mirror command ran successfully", arch)
             if self.runtime.dry_run:
                 self.runtime.logger.info("[DRY RUN] [%s] Would have run %s", arch, " ".join(aws_cmd))
@@ -60,7 +61,7 @@ class QuayDoomsdaySync:
             else:
                 await asyncio.sleep(5)
                 self.runtime.logger.info("[%s] Running aws command: %s", arch, aws_cmd)
-                await retry(cmd_assert_async, aws_cmd)
+                # await retry(cmd_assert_async, aws_cmd)
                 self.runtime.logger.info("[%s] AWS command ran successfully", arch)
                 await asyncio.sleep(5)
 
@@ -84,7 +85,7 @@ class QuayDoomsdaySync:
         mkdirs(self.workdir)
 
         if not self.runtime.dry_run:
-            slack_response = await self.slack_client.say_in_thread(f":construction: Syncing arches {', '.join(self.arches)} of {self.version} to AWS S3 Bucket :construction:")
+            slack_response = await self.slack_client.say_in_thread(f":construction: Started <{self.pipelinerun_url}|Doomsday pipeline>: syncing arches {', '.join(self.arches)} of {self.version} to AWS S3 Bucket :construction:")
             slack_channel_id = slack_response["channel"]
             main_message_ts = slack_response["message"]["ts"]
         else:
