@@ -31,39 +31,57 @@ class ScanFips:
         self.data_path = data_path
         self.nvrs = nvrs
         self.all_images = all_images
+        self.taskrun_name = os.environ.get("TASKRUN_NAME")
+        self.taskrun_namespace = os.environ.get("TASKRUN_NAMESPACE")
 
         #  Call JIRAClient.from_url() directly because Runtime.new_jira_client() does not work currently
         self.jira_client = JIRAClient.from_url(server_url=JIRA_DOMAIN, token_auth=os.environ["JIRA_TOKEN"])
 
         # Setup slack client
         self.slack_client = self.runtime.new_slack_client()
-        self.slack_client.bind_channel("#art-release")
+        self.slack_client.bind_channel("#art-cluster-monitoring")
 
-    @staticmethod
-    async def get_pipelinerun_name():
+    async def get_pipelinerun_name(self) -> Optional[str]:
         """
-        Returns the name of the currently running fips-pipeline PipelineRun in the art-cd namespace
+        Returns the name of the currently running fips-pipeline PipelineRun
         """
+        if self.taskrun_namespace is None or self.taskrun_name is None:
+            return None
+
         cmd = [
             "oc",
             "get",
             "-n",
-            "art-cd",
-            "pipelinerun",
-            "-l",
-            "tekton.dev/pipeline=fips-pipeline",
+            self.taskrun_namespace,
+            "taskrun",
+            self.taskrun_name,
             "-o",
-            "json",
+            "jsonpath={.metadata.labels.tekton\.dev/pipelineRun}",
         ]
-        _, result, _ = await exectools.cmd_gather_async(cmd)
 
-        pipelineruns = json.loads(result)
+        rc, result, _ = await exectools.cmd_gather_async(cmd, check=False)
 
-        # Get the JSON of the currently running PipelineRun
-        for pipelinerun in pipelineruns["items"]:
-            if pipelinerun["status"]["conditions"][0]["reason"] == "Running":
-                return pipelinerun["metadata"]["name"]
-        return None
+        return result if rc == 0 else None
+
+    async def construct_opening_slack_msg(self, failing_packages: dict[str, set[str]]) -> str:
+        """
+        Construct the opening message for the FIPS report thread on Slack
+        Includes number of failed builds, affected versions and link to the PipelineRun
+        """
+        failed_builds_count = sum(len(versions) for versions in failing_packages.values())
+        affected_versions = set()
+        for versions in failing_packages.values():
+            affected_versions.update(versions)
+
+        pipelinerun_name = await self.get_pipelinerun_name()
+        if pipelinerun_name is None:
+            self.runtime.logger.warning("Could not get the name of the currently running PipelineRun")
+            scan_reference = "FIPS Scan"
+        else:
+            pipelinerun_url = f"https://console-openshift-console.apps.artc2023.pc3z.p1.openshiftapps.com/k8s/ns/{self.taskrun_namespace}/tekton.dev~v1~PipelineRun/{pipelinerun_name}"
+            scan_reference = f"<{pipelinerun_url}|FIPS Scan>"
+
+        return f":warning: {scan_reference} has failed for {failed_builds_count} build(s) in the following version(s): {', '.join(affected_versions)}. Please verify (Triage <https://art-docs.engineering.redhat.com/sop/triage-fips/|docs>)"
 
     @staticmethod
     def extract_package_name(nvr: str) -> Optional[str]:
@@ -151,6 +169,8 @@ class ScanFips:
         that are currently failing the FIPS scan, and a report of packages which don't have
         a jira ticket raised (or their ticket doesn't list all the versions currently failing)
         """
+        opening_slack_msg = await self.construct_opening_slack_msg(failing_packages)
+
         package_ticket_details = self.get_package_ticket_details(failing_packages)
 
         failing_packages_report_msg = self.construct_failing_packages_report(failing_packages, package_ticket_details)
@@ -158,20 +178,7 @@ class ScanFips:
             failing_packages, package_ticket_details
         )
 
-        failed_builds_count = sum(len(versions) for versions in failing_packages.values())
-        failing_versions = set()
-        for versions in failing_packages.values():
-            failing_versions.update(versions)
-
-        pipelinerun_name = await self.get_pipelinerun_name()
-        if pipelinerun_name is None:
-            self.runtime.logger.warning("Could not get the name of the currently running PipelineRun")
-            initial_slack_msg = f":warning: FIPS scan has failed for {failed_builds_count} build(s) in the following version(s): {', '.join(failing_versions)}. Please verify (Triage <https://art-docs.engineering.redhat.com/sop/triage-fips/|docs>)"
-        else:
-            pipelinerun_url = f"https://console-openshift-console.apps.artc2023.pc3z.p1.openshiftapps.com/k8s/ns/art-cd/tekton.dev~v1~PipelineRun/{pipelinerun_name}"
-            initial_slack_msg = f":warning: <{pipelinerun_url}|FIPS scan> has failed for {failed_builds_count} build(s) in the following version(s): {', '.join(failing_versions)}. Please verify (Triage <https://art-docs.engineering.redhat.com/sop/triage-fips/|docs>)"
-
-        await self.slack_client.say_in_thread(message=initial_slack_msg)
+        await self.slack_client.say_in_thread(message=opening_slack_msg)
         await self.slack_client.say_in_thread(message=failing_packages_report_msg)
         if packages_without_ticket_report_msg:
             await self.slack_client.say_in_thread(message=packages_without_ticket_report_msg)
@@ -180,43 +187,45 @@ class ScanFips:
         results = {}
         failing_packages = defaultdict(set)
 
-        for version in ACTIVE_OCP_VERSIONS:
-            cmd = [
-                "doozer",
-                "--group",
-                f"openshift-{version}",
-                "--data-path",
-                self.data_path,
-                "images:scan-fips",
-            ]
+        # for version in ACTIVE_OCP_VERSIONS:
+        #     cmd = [
+        #         "doozer",
+        #         "--group",
+        #         f"openshift-{version}",
+        #         "--data-path",
+        #         self.data_path,
+        #         "images:scan-fips",
+        #     ]
 
-            if self.nvrs and self.all_images:
-                raise Exception("Cannot specify both --nvrs and --all-images")
+        #     if self.nvrs and self.all_images:
+        #         raise Exception("Cannot specify both --nvrs and --all-images")
 
-            if self.nvrs:
-                cmd.extend(["--nvrs", ",".join(self.nvrs)])
+        #     if self.nvrs:
+        #         cmd.extend(["--nvrs", ",".join(self.nvrs)])
 
-            if self.all_images:
-                cmd.append("--all-images")
+        #     if self.all_images:
+        #         cmd.append("--all-images")
 
-            _, result, _ = await exectools.cmd_gather_async(cmd, stderr=True)
+        #     _, result, _ = await exectools.cmd_gather_async(cmd, stderr=True)
 
-            if result:
-                result_json = json.loads(result)
-                results.update(result_json)
+        #     if result:
+        #         result_json = json.loads(result)
+        #         results.update(result_json)
 
-                package_names = map(lambda nvr: self.extract_package_name(nvr), list(result_json.keys()))
-                for package_name in package_names:
-                    failing_packages[package_name].add(version)
+        #         package_names = map(lambda nvr: self.extract_package_name(nvr), list(result_json.keys()))
+        #         for package_name in package_names:
+        #             failing_packages[package_name].add(version)
 
-            if self.all_images:
-                # Clean all the images, if we are checking for all images since this mode is used on prod only
-                # Since this command will be run for all versions, clean after each run will be more efficient. Otherwise
-                # the pod storage limit will be reached quite quickly.
-                # If on local, and do not want to clean, feel free to comment this function out
-                await exectools.cmd_assert_async("podman image prune --all --force")
+            # if self.all_images:
+            #     # Clean all the images, if we are checking for all images since this mode is used on prod only
+            #     # Since this command will be run for all versions, clean after each run will be more efficient. Otherwise
+            #     # the pod storage limit will be reached quite quickly.
+            #     # If on local, and do not want to clean, feel free to comment this function out
+            #     await exectools.cmd_assert_async("podman image prune --all --force")
 
+        results = {"ose-alibaba-cloud-csi-driver-container-TEST-4.16": "PULLSPEC", "ose-alibaba-cloud-csi-driver-container-TEST-4.17": "PULLSPEC"}
         self.runtime.logger.info(f"Result: {results}")
+        failing_packages = {"ose-alibaba-cloud-csi-driver-container": set(["4.16", "4.17"])}
 
         if failing_packages:
             # Post on Slack
