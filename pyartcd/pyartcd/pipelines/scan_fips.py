@@ -21,7 +21,6 @@ from pyartcd.runtime import Runtime
 JIRA_PROJECT = "OCPBUGS"
 JIRA_DOMAIN = "https://issues.redhat.com/"
 
-INITIAL_SLACK_MSG = ":warning: FIPS scan has failed for some builds. Please verify (Triage <https://art-docs.engineering.redhat.com/sop/triage-fips/|docs>)"
 FAILING_BUILDS_MSG_HEADER = "The listed versions of the following packages did not pass the FIPS scan:"
 PACKAGES_WITHOUT_TICKET_MSG_HEADER = "Report of missing/incomplete Jira tickets:"
 
@@ -39,6 +38,32 @@ class ScanFips:
         # Setup slack client
         self.slack_client = self.runtime.new_slack_client()
         self.slack_client.bind_channel("#art-release")
+
+    @staticmethod
+    async def get_pipelinerun_name():
+        """
+        Returns the name of the currently running fips-pipeline PipelineRun in the art-cd namespace
+        """
+        cmd = [
+            "oc",
+            "get",
+            "-n",
+            "art-cd",
+            "pipelinerun",
+            "-l",
+            "tekton.dev/pipeline=fips-pipeline",
+            "-o",
+            "json",
+        ]
+        _, result, _ = await exectools.cmd_gather_async(cmd)
+
+        pipelineruns = json.loads(result)
+
+        # Get the JSON of the currently running PipelineRun
+        for pipelinerun in pipelineruns["items"]:
+            if pipelinerun["status"]["conditions"][0]["reason"] == "Running":
+                return pipelinerun["metadata"]["name"]
+        return None
 
     @staticmethod
     def extract_package_name(nvr: str) -> Optional[str]:
@@ -133,7 +158,20 @@ class ScanFips:
             failing_packages, package_ticket_details
         )
 
-        await self.slack_client.say_in_thread(message=INITIAL_SLACK_MSG)
+        failed_builds_count = sum(len(versions) for versions in failing_packages.values())
+        failing_versions = set()
+        for versions in failing_packages.values():
+            failing_versions.update(versions)
+
+        pipelinerun_name = await self.get_pipelinerun_name()
+        if pipelinerun_name is None:
+            self.runtime.logger.warning("Could not get the name of the currently running PipelineRun")
+            initial_slack_msg = f":warning: FIPS scan has failed for {failed_builds_count} build(s) in the following version(s): {', '.join(failing_versions)}. Please verify (Triage <https://art-docs.engineering.redhat.com/sop/triage-fips/|docs>)"
+        else:
+            pipelinerun_url = f"https://console-openshift-console.apps.artc2023.pc3z.p1.openshiftapps.com/k8s/ns/art-cd/tekton.dev~v1~PipelineRun/{pipelinerun_name}"
+            initial_slack_msg = f":warning: <{pipelinerun_url}|FIPS scan> has failed for {failed_builds_count} build(s) in the following version(s): {', '.join(failing_versions)}. Please verify (Triage <https://art-docs.engineering.redhat.com/sop/triage-fips/|docs>)"
+
+        await self.slack_client.say_in_thread(message=initial_slack_msg)
         await self.slack_client.say_in_thread(message=failing_packages_report_msg)
         if packages_without_ticket_report_msg:
             await self.slack_client.say_in_thread(message=packages_without_ticket_report_msg)
