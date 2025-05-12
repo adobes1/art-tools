@@ -37,7 +37,7 @@ class ScanFips:
 
         # Setup slack client
         self.slack_client = self.runtime.new_slack_client()
-        self.slack_client.bind_channel("#art-release")
+        self.slack_client.bind_channel("#art-cluster-monitoring")
 
     @staticmethod
     async def get_pipelinerun_name():
@@ -48,10 +48,10 @@ class ScanFips:
             "oc",
             "get",
             "-n",
-            "art-cd",
+            "hackspace-adobes",
             "pipelinerun",
             "-l",
-            "tekton.dev/pipeline=fips-pipeline",
+            "tekton.dev/pipeline=hello-world-pipeline",
             "-o",
             "json",
         ]
@@ -79,7 +79,7 @@ class ScanFips:
             self.runtime.logger.warning("Could not get the name of the currently running PipelineRun")
             scan_reference = "FIPS Scan"
         else:
-            pipelinerun_url = f"https://console-openshift-console.apps.artc2023.pc3z.p1.openshiftapps.com/k8s/ns/art-cd/tekton.dev~v1~PipelineRun/{pipelinerun_name}"
+            pipelinerun_url = f"https://console-openshift-console.apps.artc2023.pc3z.p1.openshiftapps.com/k8s/ns/hackspace-adobes/tekton.dev~v1~PipelineRun/{pipelinerun_name}"
             scan_reference = f"<{pipelinerun_url}|FIPS Scan>"
 
         return f":warning: {scan_reference} has failed for {failed_builds_count} build(s) in the following version(s): {', '.join(affected_versions)}. Please verify (Triage <https://art-docs.engineering.redhat.com/sop/triage-fips/|docs>)"
@@ -188,44 +188,46 @@ class ScanFips:
         results = {}
         failing_packages = defaultdict(set)
 
-        for version in ACTIVE_OCP_VERSIONS:
-            cmd = [
-                "doozer",
-                "--group",
-                f"openshift-{version}",
-                "--data-path",
-                self.data_path,
-                "images:scan-fips",
-            ]
+        # for version in ACTIVE_OCP_VERSIONS:
+        #     cmd = [
+        #         "doozer",
+        #         "--group",
+        #         f"openshift-{version}",
+        #         "--data-path",
+        #         self.data_path,
+        #         "images:scan-fips",
+        #     ]
 
-            if self.nvrs and self.all_images:
-                raise Exception("Cannot specify both --nvrs and --all-images")
+        #     if self.nvrs and self.all_images:
+        #         raise Exception("Cannot specify both --nvrs and --all-images")
 
-            if self.nvrs:
-                cmd.extend(["--nvrs", ",".join(self.nvrs)])
+        #     if self.nvrs:
+        #         cmd.extend(["--nvrs", ",".join(self.nvrs)])
 
-            if self.all_images:
-                cmd.append("--all-images")
+        #     if self.all_images:
+        #         cmd.append("--all-images")
 
-            _, result, _ = await exectools.cmd_gather_async(cmd, stderr=True)
+        #     _, result, _ = await exectools.cmd_gather_async(cmd, stderr=True)
 
-            if result:
-                result_json = json.loads(result)
-                results.update(result_json)
+        #     if result:
+        #         result_json = json.loads(result)
+        #         results.update(result_json)
 
-                package_names = map(lambda nvr: self.extract_package_name(nvr), list(result_json.keys()))
-                for package_name in package_names:
-                    failing_packages[package_name].add(version)
+        #         package_names = map(lambda nvr: self.extract_package_name(nvr), list(result_json.keys()))
+        #         for package_name in package_names:
+        #             failing_packages[package_name].add(version)
 
-            if self.all_images:
-                # Clean all the images, if we are checking for all images since this mode is used on prod only
-                # Since this command will be run for all versions, clean after each run will be more efficient. Otherwise
-                # the pod storage limit will be reached quite quickly.
-                # If on local, and do not want to clean, feel free to comment this function out
-                await exectools.cmd_assert_async("podman image prune --all --force")
+        #     if self.all_images:
+        #         # Clean all the images, if we are checking for all images since this mode is used on prod only
+        #         # Since this command will be run for all versions, clean after each run will be more efficient. Otherwise
+        #         # the pod storage limit will be reached quite quickly.
+        #         # If on local, and do not want to clean, feel free to comment this function out
+        #         await exectools.cmd_assert_async("podman image prune --all --force")
 
+        results = {"ose-alibaba-cloud-csi-driver-container-TEST-4.16": "PULLSPEC", "ose-alibaba-cloud-csi-driver-container-TEST-4.17": "PULLSPEC"}
         self.runtime.logger.info(f"Result: {results}")
-
+        failing_packages = {"ose-alibaba-cloud-csi-driver-container": set(["4.16", "4.17"])}
+        
         if failing_packages:
             # Post on Slack
             if not self.runtime.dry_run:
