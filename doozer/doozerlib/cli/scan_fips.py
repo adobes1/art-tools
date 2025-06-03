@@ -11,6 +11,7 @@ from typing import Optional
 import click
 import koji
 from artcommonlib.exectools import cmd_gather, cmd_gather_async, limit_concurrency
+from tenacity import retry, stop_after_attempt, retry_if_result
 
 from doozerlib.cli import cli, click_coroutine, pass_runtime
 from doozerlib.runtime import Runtime
@@ -62,14 +63,13 @@ class ScanFipsCli:
                 await self.execute_and_handle_cmd(cmd, nvr)
 
     @limit_concurrency(os.cpu_count())
+    @retry(stop=stop_after_attempt(3), retry=retry_if_result(lambda result: result is not None))
     async def run_get_problem_nvrs(self, build: tuple):
         nvr, pull_spec = build
         cmd = self.make_command(f"check-payload -V {self.runtime.group.split('-')[-1]} scan image --spec {pull_spec}")
 
         self.runtime.logger.info(f"Running check-payload command: {cmd}")
         rc_scan, out_scan, _ = await cmd_gather_async(cmd, check=False)
-
-        await self.clean_image(nvr, pull_spec)
 
         return None if rc_scan == 0 and "Successful run" in out_scan else build
 
@@ -164,9 +164,12 @@ class ScanFipsCli:
             image_pullspec_mapping.append((nvr, pull_spec))
 
         tasks = [self.run_get_problem_nvrs(build) for build in image_pullspec_mapping]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        problem_images = {build[0]: build[1] for build in results if build}
+        clean_tasks = [self.clean_image(nvr, pull_spec) for nvr, pull_spec in image_pullspec_mapping]
+        await asyncio.gather(*clean_tasks)
+
+        problem_images = {build[0]: build[1] for build in results if isinstance(build, tuple)}
 
         if problem_images:
             self.runtime.logger.info("Found FIPS issues for these components:")
