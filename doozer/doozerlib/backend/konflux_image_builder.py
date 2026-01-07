@@ -141,6 +141,7 @@ class KonfluxImageBuilder:
                 engine=Engine.KONFLUX.value,
                 outcome=KonfluxBuildOutcome.SUCCESS,
                 exclude_large_columns=True,
+                extra_patterns={'nvr': f'^{component_name}-'},
             )
             if latest_build:
                 # Parse both NVRs and compare them
