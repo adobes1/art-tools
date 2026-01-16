@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import aiohttp
@@ -448,16 +449,27 @@ class Nightly:
                     f"No rhcos_inspector for nightly {nightly}, should have called populate_nightly_content first"
                 )
             nightly._rhcos_rpms = {
-                nevra[0]: (nevra[2], nevra[3]) for nevra in nightly.rhcos_inspector.get_os_metadata_rpm_list()
+                nevra[0]: (nevra[2], nevra[3], nevra[5]) for nevra in nightly.rhcos_inspector.get_os_metadata_rpm_list()
             }
 
+        # Build a map of payload tag name -> rhel_version from group config
+        rhel_version_map = {}
+        for payload_tag in self.rhcos_inspector.runtime.group_config.rhcos.payload_tags:
+            rhel_version_map[payload_tag['name']] = payload_tag['rhel_version']
+
         logger.debug(f"comparing {self.rhcos_inspector} and {other.rhcos_inspector}")
-        for rpm_name, vr in self._rhcos_rpms.items():
-            if rpm_name in other._rhcos_rpms and vr != other._rhcos_rpms[rpm_name]:
-                logger.warning(
-                    f"{self.name} differs from {other.name} because '{rpm_name}' version-release {vr} != {other._rhcos_rpms[rpm_name]}"
-                )
-                return False
+        for rpm_name, vr_source in self._rhcos_rpms.items():
+            if rpm_name in other._rhcos_rpms:
+                other_vr_source = other._rhcos_rpms[rpm_name]
+                # Get RHEL version from group config based on source tag
+                rhel_version = rhel_version_map.get(vr_source[2], '9.6')
+                other_rhel_version = rhel_version_map.get(other_vr_source[2], '9.6')
+                # Only compare if both packages are from the same RHEL version
+                if rhel_version == other_rhel_version and vr_source[:2] != other_vr_source[:2]:
+                    logger.warning(
+                        f"{self.name} differs from {other.name} because '{rpm_name}' version-release {vr_source[:2]} != {other_vr_source[:2]} (RHEL {rhel_version}: {vr_source[2]} vs {other_vr_source[2]})"
+                    )
+                    return False
 
         return True
 
