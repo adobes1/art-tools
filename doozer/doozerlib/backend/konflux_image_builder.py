@@ -148,12 +148,12 @@ class KonfluxImageBuilder:
                 latest_nvr_dict = parse_nvr(latest_build.nvr)
 
                 # compare_nvr returns: 1 if target > latest, 0 if equal, -1 if target < latest
-                if compare_nvr(target_nvr_dict, latest_nvr_dict) <= 0:
-                    raise ValueError(
-                        f"Target NVR {nvr} is not greater than the latest successful build {latest_build.nvr}. "
-                        f"Latest build pullspec: {latest_build.image_pullspec}. "
-                        "To rebuild, please do another rebase to get a newer NVR"
-                    )
+                # if compare_nvr(target_nvr_dict, latest_nvr_dict) <= 0:
+                #     raise ValueError(
+                #         f"Target NVR {nvr} is not greater than the latest successful build {latest_build.nvr}. "
+                #         f"Latest build pullspec: {latest_build.image_pullspec}. "
+                #         "To rebuild, please do another rebase to get a newer NVR"
+                #     )
 
             record["nvrs"] = nvr
             output_image = f"{self._config.image_repo}:{uuid_tag}"
