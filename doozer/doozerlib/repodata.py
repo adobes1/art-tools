@@ -270,11 +270,17 @@ class Repodata:
 
         Returns:
             List containing specific RPM + latest RPM (if latest >= specific).
-            Empty list if specific version not available in this repo.
+            Falls back to latest if specific version not available in this repo.
         """
         specific_rpm = self._find_specific_rpm(original_nvr, matching_rpms)
         if not specific_rpm:
-            return []
+            # If the specific NVR isn't found, fall back to the latest available version
+            # instead of dropping the package entirely. This handles cases where:
+            # - Plashets were rebuilt and old NVRs removed
+            # - Cross-assembly seeding where seed NVR doesn't exist in target repos
+            # - First build after enabling lockfiles
+            latest_rpm = self._find_latest_rpm(matching_rpms)
+            return [latest_rpm] if latest_rpm else []
 
         result_rpms = [specific_rpm]
 
