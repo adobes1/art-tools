@@ -143,10 +143,9 @@ class BuildMicroShiftBootcPipeline:
         ]
 
     async def run(self):
-        # Skip quay sync for test assembly
-        test_mode = self.assembly == 'test_microshift_bootc'
-        if test_mode:
-            self._logger.warning(f"TEST MODE: Skipping quay sync for assembly: {self.assembly}")
+        # TEST MODE: Comment out for fork testing
+        test_mode = True
+        self._logger.warning(f"TEST MODE: Running from fork - skipping all external operations")
 
         # Make sure our api.ci token is fresh
         await oc.registry_login()
@@ -220,19 +219,20 @@ class BuildMicroShiftBootcPipeline:
             self._logger.warning(f"Skipping sync to {art_repo} since in {mode_reason} mode")
 
         # Pin the image to the assembly if not STREAM
-        if self.assembly_type != AssemblyTypes.STREAM:
-            # Check if we need to create a PR to pin the build
-            pinned_nvr = get_image_if_pinned_directly(self.releases_config, self.assembly, 'microshift-bootc')
-            if bootc_build.nvr != pinned_nvr:
-                self._logger.info("Creating PR to pin microshift-bootc image: %s", bootc_build.nvr)
-                await self._create_or_update_pull_request_for_image(bootc_build.nvr)
-
-            if self.prepare_shipment:
-                await self._prepare_shipment(bootc_build)
-
-            if self.shipment_mr_url and not self.runtime.dry_run:
-                await self._set_shipment_mr_ready()
-                await self.slack_client.say_in_thread("Completed preparing microshift-bootc shipment.")
+        # TEST MODE: Commented out to prevent PR/shipment creation
+        # if self.assembly_type != AssemblyTypes.STREAM:
+        #     # Check if we need to create a PR to pin the build
+        #     pinned_nvr = get_image_if_pinned_directly(self.releases_config, self.assembly, 'microshift-bootc')
+        #     if bootc_build.nvr != pinned_nvr:
+        #         self._logger.info("Creating PR to pin microshift-bootc image: %s", bootc_build.nvr)
+        #         await self._create_or_update_pull_request_for_image(bootc_build.nvr)
+        #
+        #     if self.prepare_shipment:
+        #         await self._prepare_shipment(bootc_build)
+        #
+        #     if self.shipment_mr_url and not self.runtime.dry_run:
+        #         await self._set_shipment_mr_ready()
+        #         await self.slack_client.say_in_thread("Completed preparing microshift-bootc shipment.")
 
     async def sync_to_mirror(self, arch, el_target, pullspec):
         arch = brew_arch_for_go_arch(arch)
@@ -1123,9 +1123,9 @@ async def build_microshift_bootc(
         slack_message = f"build-microshift-bootc pipeline encountered error: {err}"
         error_message = slack_message + f"\n {traceback.format_exc()}"
         runtime.logger.error(error_message)
-        # Skip slack notification for test assembly
-        if assembly != 'test_microshift_bootc':
-            await slack_client.say_in_thread(slack_message)
-        else:
-            runtime.logger.info(f"[TEST MODE] Skipping slack error notification for assembly: {assembly}")
+        # TEST MODE: Always skip slack notifications
+        # if assembly != 'test_microshift_bootc':
+        #     await slack_client.say_in_thread(slack_message)
+        # else:
+        runtime.logger.info(f"[TEST MODE] Skipping slack error notification for assembly: {assembly}")
         raise
