@@ -143,6 +143,11 @@ class BuildMicroShiftBootcPipeline:
         ]
 
     async def run(self):
+        # Skip quay sync for test assembly
+        test_mode = self.assembly == 'test_microshift_bootc'
+        if test_mode:
+            self._logger.warning(f"TEST MODE: Skipping quay sync for assembly: {self.assembly}")
+
         # Make sure our api.ci token is fresh
         await oc.registry_login()
         data_path = self._doozer_env_vars["DOOZER_DATA_PATH"]
@@ -191,7 +196,7 @@ class BuildMicroShiftBootcPipeline:
         digest_by_arch = {m["platform"]["architecture"]: m["digest"] for m in manifest_list["manifests"]}
         self._logger.info("Bootc image digests by arch: %s", json.dumps(digest_by_arch, indent=4))
 
-        if not self.runtime.dry_run:
+        if not self.runtime.dry_run and not test_mode:
             major, _ = self._ocp_version
             if bootc_build.embargoed:
                 art_repo = get_art_prod_image_repo_for_version(major, "dev-priv")
@@ -211,7 +216,8 @@ class BuildMicroShiftBootcPipeline:
         else:
             major, _ = self._ocp_version
             art_repo = get_art_prod_image_repo_for_version(major, "dev")
-            self._logger.warning(f"Skipping sync to {art_repo} since in dry-run mode")
+            mode_reason = 'test' if test_mode else 'dry-run'
+            self._logger.warning(f"Skipping sync to {art_repo} since in {mode_reason} mode")
 
         # Pin the image to the assembly if not STREAM
         if self.assembly_type != AssemblyTypes.STREAM:
@@ -1117,5 +1123,9 @@ async def build_microshift_bootc(
         slack_message = f"build-microshift-bootc pipeline encountered error: {err}"
         error_message = slack_message + f"\n {traceback.format_exc()}"
         runtime.logger.error(error_message)
-        await slack_client.say_in_thread(slack_message)
+        # Skip slack notification for test assembly
+        if assembly != 'test_microshift_bootc':
+            await slack_client.say_in_thread(slack_message)
+        else:
+            runtime.logger.info(f"[TEST MODE] Skipping slack error notification for assembly: {assembly}")
         raise
