@@ -4,8 +4,14 @@ import re
 import click
 import yaml
 from artcommonlib import exectools, redis
+from artcommonlib.constants import (
+    KONFLUX_DEFAULT_IMAGE_REPO,
+    REGISTRY_CI_OPENSHIFT,
+    REGISTRY_QUAY_OCP_RELEASE_DEV,
+)
 from artcommonlib.github_auth import get_github_client_for_org
 from artcommonlib.redis import RedisError
+from artcommonlib.registry_config import RegistryConfig
 from artcommonlib.release_util import SoftwareLifecyclePhase
 from artcommonlib.telemetry import start_as_current_span_async
 from artcommonlib.util import split_git_url
@@ -14,7 +20,6 @@ from opentelemetry import trace
 from pyartcd import constants, jenkins, locks
 from pyartcd.cli import cli, click_coroutine, pass_runtime
 from pyartcd.jenkins import get_build_url
-from pyartcd.oc import registry_login
 from pyartcd.runtime import GroupRuntime, Runtime
 from pyartcd.util import branch_arches
 
@@ -147,12 +152,31 @@ class BuildSyncMultiPipeline:
             text_body = f"Multi-model build sync job [run]({self.job_run}) has been triggered"
             await self.comment_on_assembly_pr(text_body)
 
-        # Make sure we're logged into the OC registry
-        await registry_login()
+        quay_auth_file = os.getenv('QUAY_AUTH_FILE')
+        if not quay_auth_file:
+            raise ValueError(
+                "QUAY_AUTH_FILE environment variable is required but not set. "
+                "Ensure Jenkins credentials are properly bound."
+            )
 
-        # Generate multi-model nightly imagestream
-        self.logger.info('Generate multi-model nightly imagestream...')
-        await self._generate_multi_model_imagestream()
+        with RegistryConfig(
+            kubeconfig=os.environ.get('KUBECONFIG'),
+            source_files=[quay_auth_file],
+            registries=[
+                REGISTRY_QUAY_OCP_RELEASE_DEV,
+                KONFLUX_DEFAULT_IMAGE_REPO,
+                REGISTRY_CI_OPENSHIFT,
+            ],
+        ) as global_auth_file:
+            self._registry_config = global_auth_file
+            self.logger.info(
+                'Set registry auth file=%s for pipeline operations',
+                global_auth_file,
+            )
+
+            # Generate multi-model nightly imagestream
+            self.logger.info('Generate multi-model nightly imagestream...')
+            await self._generate_multi_model_imagestream()
 
     @start_as_current_span_async(TRACER, "build-sync-multi.handle-success")
     async def handle_success(self):
@@ -203,6 +227,8 @@ class BuildSyncMultiPipeline:
         if self.doozer_data_gitref:
             group_param += f'@{self.doozer_data_gitref}'
         cmd.append(group_param)
+        if self._registry_config:
+            cmd.append(f'--registry-config={self._registry_config}')
         cmd.extend(
             [
                 'release:gen-payload',
