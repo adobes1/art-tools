@@ -976,5 +976,323 @@ class TestRunWithTemplate(unittest.TestCase):
         self.assertIsNone(release_notes)
 
 
+class TestFindExistingShipmentMr(unittest.TestCase):
+    """Tests for _find_existing_shipment_mr()."""
+
+    def _make_pipeline(self, dry_run=False):
+        runtime = MagicMock()
+        runtime.dry_run = dry_run
+        runtime.working_dir = MagicMock()
+        runtime.working_dir.absolute.return_value = MagicMock()
+        runtime.config = {"gitlab_url": "https://gitlab.example.com"}
+
+        pipeline = ReleaseFromFbcPipeline(
+            runtime=runtime,
+            group="logging-6.5",
+            assembly="6.5.1",
+            fbc_pullspecs=["quay.io/test/fbc:latest"],
+            create_mr=True,
+        )
+        pipeline.product = "logging"
+        pipeline.gitlab_token = "test-token"
+        return pipeline
+
+    def test_no_releases_config_returns_none(self):
+        pipeline = self._make_pipeline()
+        pipeline.releases_config = None
+        result = pipeline._find_existing_shipment_mr()
+        self.assertIsNone(result)
+
+    def test_no_shipment_url_in_config_returns_none(self):
+        pipeline = self._make_pipeline()
+        pipeline.releases_config = {"releases": {"6.5.1": {"assembly": {"group": {}}}}}
+        result = pipeline._find_existing_shipment_mr()
+        self.assertIsNone(result)
+
+    def test_empty_releases_config_returns_none(self):
+        pipeline = self._make_pipeline()
+        pipeline.releases_config = {}
+        result = pipeline._find_existing_shipment_mr()
+        self.assertIsNone(result)
+
+    def test_existing_open_mr_returns_branch(self):
+        pipeline = self._make_pipeline()
+        pipeline.releases_config = {
+            "releases": {
+                "6.5.1": {
+                    "assembly": {
+                        "group": {
+                            "shipment": {"url": "https://gitlab.example.com/org/repo/-/merge_requests/42"}
+                        }
+                    }
+                }
+            }
+        }
+
+        mock_mr = MagicMock()
+        mock_mr.state = "opened"
+        mock_mr.source_branch = "prepare-shipment-6.5.1-20260501120000"
+
+        mock_gitlab = MagicMock()
+        mock_gitlab.get_mr_from_url.return_value = mock_mr
+        pipeline.__dict__["_gitlab"] = mock_gitlab
+
+        result = pipeline._find_existing_shipment_mr()
+        self.assertEqual(result, "prepare-shipment-6.5.1-20260501120000")
+        self.assertEqual(pipeline.shipment_mr_url, "https://gitlab.example.com/org/repo/-/merge_requests/42")
+
+    def test_closed_mr_raises(self):
+        pipeline = self._make_pipeline()
+        pipeline.releases_config = {
+            "releases": {
+                "6.5.1": {
+                    "assembly": {
+                        "group": {
+                            "shipment": {"url": "https://gitlab.example.com/org/repo/-/merge_requests/42"}
+                        }
+                    }
+                }
+            }
+        }
+
+        mock_mr = MagicMock()
+        mock_mr.state = "merged"
+
+        mock_gitlab = MagicMock()
+        mock_gitlab.get_mr_from_url.return_value = mock_mr
+        pipeline.__dict__["_gitlab"] = mock_gitlab
+
+        with self.assertRaises(ValueError):
+            pipeline._find_existing_shipment_mr()
+
+
+class TestCreateShipmentMrWithExisting(unittest.TestCase):
+    """Tests for create_shipment_mr() reusing existing MRs."""
+
+    def _make_pipeline(self, dry_run=False):
+        runtime = MagicMock()
+        runtime.dry_run = dry_run
+        runtime.working_dir = MagicMock()
+        runtime.working_dir.absolute.return_value = MagicMock()
+        runtime.config = {"gitlab_url": "https://gitlab.example.com"}
+
+        pipeline = ReleaseFromFbcPipeline(
+            runtime=runtime,
+            group="logging-6.5",
+            assembly="6.5.1",
+            fbc_pullspecs=["quay.io/test/fbc:latest"],
+            create_mr=True,
+        )
+        pipeline.product = "logging"
+        pipeline.gitlab_token = "test-token"
+        pipeline.shipment_data_repo = AsyncMock()
+        pipeline.shipment_data_repo_push_url = "https://gitlab.example.com/user/ocp-shipment-data.git"
+        pipeline.shipment_data_repo_pull_url = "https://gitlab.example.com/org/ocp-shipment-data.git"
+        return pipeline
+
+    @patch("pyartcd.pipelines.release_from_fbc.exectools.cmd_gather_async")
+    def test_reuses_existing_mr(self, mock_cmd):
+        """When an existing open MR is found, reuse its branch and update the MR."""
+        mock_cmd.return_value = (0, "None", "")
+
+        pipeline = self._make_pipeline(dry_run=False)
+        pipeline.update_shipment_data = AsyncMock(return_value=True)
+        pipeline.job_url = "https://jenkins/job/123"
+
+        existing_mr_url = "https://gitlab.example.com/org/repo/-/merge_requests/42"
+        mock_existing_mr = MagicMock()
+        mock_existing_mr.state = "opened"
+        mock_existing_mr.source_branch = "prepare-shipment-6.5.1-20260501120000"
+        mock_existing_mr.web_url = existing_mr_url
+        mock_existing_mr.description = "Original description"
+
+        mock_gitlab = MagicMock()
+        mock_gitlab.get_mr_from_url.return_value = mock_existing_mr
+        pipeline.__dict__["_gitlab"] = mock_gitlab
+
+        pipeline.releases_config = {
+            "releases": {
+                "6.5.1": {
+                    "assembly": {
+                        "group": {"shipment": {"url": existing_mr_url}}
+                    }
+                }
+            }
+        }
+
+        pipeline._get_gitlab_project = MagicMock()
+
+        mr_url = asyncio.run(pipeline.create_shipment_mr({}, env="prod"))
+
+        self.assertEqual(mr_url, existing_mr_url)
+        self.assertFalse(pipeline._shipment_mr_is_new)
+        pipeline.shipment_data_repo.fetch_switch_branch.assert_awaited_once_with(
+            "prepare-shipment-6.5.1-20260501120000", remote="origin"
+        )
+        pipeline.shipment_data_repo.create_branch.assert_not_awaited()
+
+    @patch("pyartcd.pipelines.release_from_fbc.exectools.cmd_gather_async")
+    def test_creates_new_mr_when_no_existing(self, mock_cmd):
+        """When no existing MR is found, create a new one."""
+        mock_cmd.return_value = (0, "None", "")
+
+        pipeline = self._make_pipeline(dry_run=False)
+        pipeline.update_shipment_data = AsyncMock(return_value=True)
+        pipeline.releases_config = None
+
+        mock_source_project = MagicMock()
+        mock_mr = MagicMock()
+        mock_mr.web_url = "https://gitlab.example.com/org/repo/-/merge_requests/99"
+        mock_source_project.mergerequests.create.return_value = mock_mr
+        pipeline._get_gitlab_project = MagicMock(return_value=mock_source_project)
+
+        mock_gitlab = MagicMock()
+        pipeline.__dict__["_gitlab"] = mock_gitlab
+
+        mr_url = asyncio.run(pipeline.create_shipment_mr({}, env="prod"))
+
+        self.assertEqual(mr_url, mock_mr.web_url)
+        self.assertTrue(pipeline._shipment_mr_is_new)
+        pipeline.shipment_data_repo.create_branch.assert_awaited_once()
+
+    @patch("pyartcd.pipelines.release_from_fbc.exectools.cmd_gather_async")
+    def test_no_changes_with_existing_mr_returns_url(self, mock_cmd):
+        """When existing MR found but no changes, return existing URL without error."""
+        mock_cmd.return_value = (0, "None", "")
+
+        pipeline = self._make_pipeline(dry_run=False)
+        pipeline.update_shipment_data = AsyncMock(return_value=False)
+
+        existing_mr_url = "https://gitlab.example.com/org/repo/-/merge_requests/42"
+        mock_existing_mr = MagicMock()
+        mock_existing_mr.state = "opened"
+        mock_existing_mr.source_branch = "prepare-shipment-6.5.1-20260501120000"
+
+        mock_gitlab = MagicMock()
+        mock_gitlab.get_mr_from_url.return_value = mock_existing_mr
+        pipeline.__dict__["_gitlab"] = mock_gitlab
+
+        pipeline.releases_config = {
+            "releases": {
+                "6.5.1": {
+                    "assembly": {
+                        "group": {"shipment": {"url": existing_mr_url}}
+                    }
+                }
+            }
+        }
+
+        mr_url = asyncio.run(pipeline.create_shipment_mr({}, env="prod"))
+        self.assertEqual(mr_url, existing_mr_url)
+
+
+class TestUpdateBuildData(unittest.TestCase):
+    """Tests for _update_build_data()."""
+
+    def _make_pipeline(self):
+        runtime = MagicMock()
+        runtime.dry_run = False
+        runtime.working_dir = MagicMock()
+        runtime.working_dir.absolute.return_value = MagicMock()
+        runtime.config = {"gitlab_url": "https://gitlab.example.com"}
+
+        pipeline = ReleaseFromFbcPipeline(
+            runtime=runtime,
+            group="logging-6.5",
+            assembly="6.5.1",
+            fbc_pullspecs=["quay.io/test/fbc:latest"],
+            create_mr=True,
+        )
+        pipeline.product = "logging"
+        pipeline.shipment_mr_url = "https://gitlab.example.com/org/repo/-/merge_requests/42"
+        return pipeline
+
+    def test_creates_assembly_entry_from_empty(self):
+        """When releases.yml is empty, creates the full structure."""
+        pipeline = self._make_pipeline()
+        upstream_repo = MagicMock()
+        content_mock = MagicMock()
+        content_mock.decoded_content = b""
+        upstream_repo.get_contents.return_value = content_mock
+
+        changed, config = pipeline._update_build_data("some-branch", upstream_repo)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            config["releases"]["6.5.1"]["assembly"]["group"]["shipment"]["url"],
+            "https://gitlab.example.com/org/repo/-/merge_requests/42",
+        )
+
+    def test_updates_existing_assembly(self):
+        """When assembly already exists, adds shipment URL."""
+        pipeline = self._make_pipeline()
+        upstream_repo = MagicMock()
+
+        import yaml as stdlib_yaml
+        existing = {"releases": {"6.5.1": {"assembly": {"group": {"some_key": "value"}}}}}
+        content_mock = MagicMock()
+        content_mock.decoded_content = stdlib_yaml.dump(existing).encode()
+        upstream_repo.get_contents.return_value = content_mock
+
+        changed, config = pipeline._update_build_data("some-branch", upstream_repo)
+
+        self.assertTrue(changed)
+        self.assertEqual(config["releases"]["6.5.1"]["assembly"]["group"]["some_key"], "value")
+        self.assertEqual(
+            config["releases"]["6.5.1"]["assembly"]["group"]["shipment"]["url"],
+            "https://gitlab.example.com/org/repo/-/merge_requests/42",
+        )
+
+    def test_uses_override_marker_for_child_assembly(self):
+        """When assembly has a basis parent, uses 'shipment!' key."""
+        pipeline = self._make_pipeline()
+        upstream_repo = MagicMock()
+
+        import yaml as stdlib_yaml
+        existing = {
+            "releases": {
+                "6.5.1": {
+                    "assembly": {
+                        "basis": {"assembly": "6.5.0"},
+                        "group": {},
+                    }
+                }
+            }
+        }
+        content_mock = MagicMock()
+        content_mock.decoded_content = stdlib_yaml.dump(existing).encode()
+        upstream_repo.get_contents.return_value = content_mock
+
+        changed, config = pipeline._update_build_data("some-branch", upstream_repo)
+
+        self.assertTrue(changed)
+        self.assertIn("shipment!", config["releases"]["6.5.1"]["assembly"]["group"])
+        self.assertNotIn("shipment", config["releases"]["6.5.1"]["assembly"]["group"])
+
+    def test_no_change_returns_false(self):
+        """When URL is already set to the same value, returns False."""
+        pipeline = self._make_pipeline()
+        upstream_repo = MagicMock()
+
+        import yaml as stdlib_yaml
+        existing = {
+            "releases": {
+                "6.5.1": {
+                    "assembly": {
+                        "group": {
+                            "shipment": {"url": "https://gitlab.example.com/org/repo/-/merge_requests/42"}
+                        }
+                    }
+                }
+            }
+        }
+        content_mock = MagicMock()
+        content_mock.decoded_content = stdlib_yaml.dump(existing).encode()
+        upstream_repo.get_contents.return_value = content_mock
+
+        changed, config = pipeline._update_build_data("some-branch", upstream_repo)
+        self.assertFalse(changed)
+
+
 if __name__ == "__main__":
     unittest.main()

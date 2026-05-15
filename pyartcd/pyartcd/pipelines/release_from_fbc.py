@@ -1,9 +1,12 @@
 import asyncio
+import copy
+import io
 import json
 import logging
 import os
 import shutil
 import tempfile
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from functools import cached_property
@@ -15,10 +18,12 @@ from urllib.parse import urlparse
 import click
 import yaml as stdlib_yaml
 from artcommonlib import exectools
+from artcommonlib.assembly import assembly_config_struct
 from artcommonlib.constants import SHIPMENT_DATA_URL_TEMPLATE
 from artcommonlib.gitdata import SafeFormatter
 from artcommonlib.github_auth import get_github_client_for_org
 from artcommonlib.gitlab import GitLabClient
+from artcommonlib.model import Model
 from artcommonlib.rpm_utils import parse_nvr
 from artcommonlib.util import new_roundtrip_yaml_handler
 from elliottlib.shipment_model import (
@@ -40,6 +45,7 @@ from pyartcd import constants
 from pyartcd.cli import cli, click_coroutine, pass_runtime
 from pyartcd.git import GitRepository
 from pyartcd.runtime import Runtime
+from pyartcd.util import load_releases_config
 
 yaml = new_roundtrip_yaml_handler()
 
@@ -99,8 +105,11 @@ class ReleaseFromFbcPipeline:
         self.gitlab_url = self.runtime.config.get("gitlab_url", "https://gitlab.cee.redhat.com")
         self.gitlab_token = None
         self.shipment_mr_url = None
+        self._shipment_mr_is_new = False
         self.job_url = None
 
+        # Releases config - loaded in run() from ocp-build-data
+        self.releases_config = None
         # Product configuration - initialized to None, will be loaded from group config in run()
         self.product = None
 
@@ -250,6 +259,10 @@ class ReleaseFromFbcPipeline:
         rest_of_url = "".join(url_parts)
         # Use oauth2 as placeholder username and token as password
         return f'{scheme}://oauth2:{token}@{netloc}{rest_of_url}'
+
+    @property
+    def assembly_group_config(self) -> Model:
+        return assembly_config_struct(Model(self.releases_config), self.assembly, "group", {})
 
     @cached_property
     def _gitlab(self) -> GitLabClient:
@@ -657,27 +670,64 @@ class ReleaseFromFbcPipeline:
 
         return ShipmentConfig(shipment=shipment)
 
+    def _find_existing_shipment_mr(self) -> Optional[str]:
+        """Check assembly config for an existing shipment MR URL and validate it.
+
+        Returns the MR's source branch name if a valid open MR is found, None otherwise.
+        """
+        if not self.releases_config:
+            return None
+
+        shipment_config = self.assembly_group_config.get("shipment", {})
+        existing_mr_url = shipment_config.get("url") if isinstance(shipment_config, dict) else None
+
+        if not existing_mr_url:
+            return None
+
+        self.logger.info("Found existing shipment MR URL in assembly config: %s", existing_mr_url)
+
+        mr = self._gitlab.get_mr_from_url(existing_mr_url)
+        if not mr:
+            raise ValueError(f"Could not find MR at URL: {existing_mr_url}")
+
+        if mr.state != "opened":
+            raise ValueError(f"Existing shipment MR {existing_mr_url} state is '{mr.state}', not 'opened'.")
+
+        self.shipment_mr_url = existing_mr_url
+        return mr.source_branch
+
     async def create_shipment_mr(self, shipments_by_kind: Dict[str, ShipmentConfig], env: str = "prod") -> str:
         """
-        Create a new shipment MR with the given shipment config files.
+        Create or update a shipment MR with the given shipment config files.
+
+        If an existing open MR is found in the assembly config, reuses its branch
+        and updates it. Otherwise creates a new MR.
         """
         if not self.create_mr:
             return ""
 
-        self.logger.info("Creating shipment MR...")
-
-        # Create branch name
-        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
-        source_branch = f"prepare-shipment-{self.assembly}-{timestamp}"
         target_branch = "main"
 
-        # Create and checkout branch
-        await self.shipment_data_repo.create_branch(source_branch)
+        # Check for existing open shipment MR
+        existing_branch = self._find_existing_shipment_mr()
+
+        if existing_branch:
+            source_branch = existing_branch
+            self.logger.info("Reusing existing shipment MR branch: %s", source_branch)
+            await self.shipment_data_repo.fetch_switch_branch(source_branch, remote="origin")
+        else:
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+            source_branch = f"prepare-shipment-{self.assembly}-{timestamp}"
+            self.logger.info("Creating new shipment branch: %s", source_branch)
+            await self.shipment_data_repo.create_branch(source_branch)
 
         # Update shipment data repo with shipment configs
         commit_message = f"Add shipment configurations for {self.product} {self.assembly}"
         updated = await self.update_shipment_data(shipments_by_kind, env, commit_message, source_branch)
         if not updated:
+            if existing_branch:
+                self.logger.info("No changes detected, reusing existing MR: %s", self.shipment_mr_url)
+                return self.shipment_mr_url
             raise ValueError("Failed to update shipment data repo. Please investigate.")
 
         source_project = self._get_gitlab_project(self.shipment_data_repo_push_url)
@@ -692,8 +742,21 @@ class ReleaseFromFbcPipeline:
         mr_description += f"Shipment files created for {self.assembly} using release-from-fbc command"
 
         if self.dry_run:
-            self.logger.info("[DRY-RUN] Would have created MR with title: %s", mr_title)
-            mr_url = f"{self.gitlab_url}/placeholder/placeholder/-/merge_requests/placeholder"
+            if existing_branch:
+                self.logger.info("[DRY-RUN] Would have updated existing MR: %s", self.shipment_mr_url)
+                mr_url = self.shipment_mr_url
+            else:
+                self.logger.info("[DRY-RUN] Would have created MR with title: %s", mr_title)
+                mr_url = f"{self.gitlab_url}/placeholder/placeholder/-/merge_requests/placeholder"
+                self._shipment_mr_is_new = True
+        elif existing_branch:
+            # Update existing MR description to note the re-run
+            mr = self._gitlab.get_mr_from_url(self.shipment_mr_url)
+            job_info = f"\n\nUpdated by job: {self.job_url}" if self.job_url else ""
+            mr.description = f"{mr.description}{job_info}"
+            mr.save()
+            mr_url = self.shipment_mr_url
+            self.logger.info("Updated existing Merge Request: %s", mr_url)
         else:
             mr = source_project.mergerequests.create(
                 {
@@ -706,18 +769,20 @@ class ReleaseFromFbcPipeline:
                 }
             )
             mr_url = mr.web_url
+            self._shipment_mr_is_new = True
             self.logger.info("Created Merge Request: %s", mr_url)
 
-        # Configure approval rules from group.yml if defined
-        approvers_config = await self._load_mr_approvers_from_group_config()
-        if approvers_config:
-            if self.dry_run:
-                self.logger.info("[DRY-RUN] Would set MR approval rules: %s", approvers_config)
-            else:
-                try:
-                    await self._gitlab.set_mr_approval_rules(mr_url, approvers_config)
-                except Exception as e:
-                    self.logger.warning(f"Failed to set MR approval rules: {e}")
+        # Configure approval rules from group.yml if defined (only for new MRs)
+        if self._shipment_mr_is_new:
+            approvers_config = await self._load_mr_approvers_from_group_config()
+            if approvers_config:
+                if self.dry_run:
+                    self.logger.info("[DRY-RUN] Would set MR approval rules: %s", approvers_config)
+                else:
+                    try:
+                        await self._gitlab.set_mr_approval_rules(mr_url, approvers_config)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to set MR approval rules: {e}")
 
         # Store the MR URL for later use
         self.shipment_mr_url = mr_url
@@ -742,6 +807,121 @@ class ReleaseFromFbcPipeline:
                     self.logger.warning(f"Failed to trigger CI pipeline for MR branch {mr.source_branch}")
             except Exception as e:
                 self.logger.warning(f"Failed to trigger CI MR pipeline for branch {mr.source_branch}: {e}")
+
+    def _update_build_data(self, branch: str, upstream_repo) -> tuple:
+        """Update releases.yml with shipment MR URL.
+
+        Returns (changed, new_releases_config) tuple.
+        """
+        try:
+            release_file_content = yaml.load(upstream_repo.get_contents("releases.yml", ref=branch).decoded_content)
+        except Exception:
+            release_file_content = yaml.load(upstream_repo.get_contents("releases.yml", ref=self.group).decoded_content)
+
+        # Handle empty releases.yml (common for layered products)
+        if not release_file_content:
+            release_file_content = {}
+        release_file_content.setdefault("releases", {})
+
+        source_file_content = copy.deepcopy(release_file_content)
+        new_releases_config = copy.deepcopy(release_file_content)
+
+        shipment_url_config = {"url": self.shipment_mr_url}
+
+        # Create assembly entry if it doesn't exist
+        new_releases_config["releases"].setdefault(self.assembly, {"assembly": {}})
+        assembly_def = new_releases_config["releases"][self.assembly].setdefault("assembly", {})
+        has_parent = bool(assembly_def.get("basis", {}).get("assembly"))
+
+        key_name = "shipment!" if has_parent else "shipment"
+
+        group_config = assembly_def.setdefault("group", {})
+        group_config[key_name] = shipment_url_config
+
+        if source_file_content == new_releases_config:
+            return False, new_releases_config
+
+        return True, new_releases_config
+
+    async def _create_or_update_build_data_pr(self) -> bool:
+        """Create or update a PR in ocp-build-data to persist the shipment MR URL in releases.yml."""
+        branch = f"update-shipment-url-{self.assembly}"
+        pr_title = f"Update shipment URL for {self.product} assembly {self.assembly}"
+        pr_body = f"This PR updates the shipment MR URL for {self.product} {self.assembly} assembly."
+        if self.job_url:
+            pr_body += f"\n\nCreated by job: {self.job_url}"
+
+        if self.dry_run:
+            self.logger.info(
+                "[DRY-RUN] Would have created PR with head '%s', title '%s'", branch, pr_title,
+            )
+            return True
+
+        data_path = constants.OCP_BUILD_DATA_URL
+        parts = data_path.rstrip("/").rstrip(".git").split("/")
+        user, repo_name = parts[-2], parts[-1]
+        github_client = get_github_client_for_org(user)
+        upstream_repo = github_client.get_repo(f"{user}/{repo_name}")
+
+        changed, new_releases_config = self._update_build_data(branch, upstream_repo)
+        if not changed:
+            self.logger.info("No changes in shipment config. PR will not be created.")
+            return False
+
+        # Delete existing branch if it exists
+        for b in upstream_repo.get_branches():
+            if b.name == branch:
+                upstream_repo.get_git_ref(f"heads/{branch}").delete()
+
+        upstream_repo.create_git_ref(f"refs/heads/{branch}", upstream_repo.get_branch(self.group).commit.sha)
+
+        output = io.BytesIO()
+        yaml.dump(new_releases_config, output)
+        output.seek(0)
+        fork_file = upstream_repo.get_contents("releases.yml", ref=branch)
+        upstream_repo.update_file("releases.yml", pr_body, output.read(), fork_file.sha, branch=branch)
+
+        pr = upstream_repo.create_pull(title=pr_title, body=pr_body, base=self.group, head=branch)
+        self.logger.info("Created PR to update shipment URL: %s", pr.html_url)
+
+        await self._wait_for_pr_merge(pr, user, repo_name)
+        return True
+
+    async def _wait_for_pr_merge(self, pr, github_user: str, github_repo: str):
+        """Wait for a PR to pass CI and merge it."""
+        timeout = 30 * 60
+        start_time = time.time()
+        check_interval = 30
+
+        self.logger.info("Waiting for CI to pass before merging PR: %s", pr.html_url)
+
+        while True:
+            if (time.time() - start_time) > timeout:
+                raise TimeoutError(f"Timeout waiting for PR CI to pass (30 minutes): {pr.html_url}")
+
+            pr = get_github_client_for_org(github_user).get_repo(f"{github_user}/{github_repo}").get_pull(pr.number)
+
+            if pr.state == "closed":
+                if pr.merged:
+                    self.logger.info("PR was already merged: %s", pr.html_url)
+                    return
+                raise RuntimeError(f"PR was closed without merging: {pr.html_url}")
+
+            try:
+                merge_result = pr.merge()
+                if merge_result.merged:
+                    self.logger.info("PR successfully merged: %s", pr.html_url)
+                    return
+                self.logger.info("PR merge not ready: %s", merge_result.message)
+            except GithubException as e:
+                if e.status == 405 and "Required status check" in str(e):
+                    self.logger.info("CI checks still running, waiting...")
+                elif e.status == 405 and "Pull Request is not mergeable" in str(e):
+                    self.logger.info("PR not mergeable yet, waiting...")
+                else:
+                    self.logger.warning("Merge attempt failed: %s", e)
+
+            await asyncio.sleep(check_interval)
 
     async def update_shipment_data(
         self, shipments_by_kind: Dict[str, ShipmentConfig], env: str, commit_message: str, branch: str
@@ -939,6 +1119,9 @@ class ReleaseFromFbcPipeline:
         if self.create_mr:
             await self.setup_shipment_repo()
 
+        # Load releases config from ocp-build-data
+        self.releases_config = await load_releases_config(group=self.group)
+
         # Load product from group configuration
         self.product = await self._load_product_from_group_config()
         self.logger.info(f"Loaded product '{self.product}' - continuing workflow for {self.product} {self.assembly}")
@@ -1035,8 +1218,15 @@ class ReleaseFromFbcPipeline:
             try:
                 mr_url = await self.create_shipment_mr(shipments_by_kind, env="prod")
                 if mr_url:
-                    self.logger.info(f"Created shipment MR: {mr_url}")
+                    self.logger.info(f"Shipment MR: {mr_url}")
                     await self.set_shipment_mr_ready()
+
+                    # Persist shipment URL to ocp-build-data (only for newly created MRs)
+                    if self._shipment_mr_is_new and self.releases_config:
+                        try:
+                            await self._create_or_update_build_data_pr()
+                        except Exception as e:
+                            self.logger.warning(f"Failed to persist shipment URL to ocp-build-data: {e}")
             except Exception as e:
                 self.logger.exception(f"Failed to create MR: {e}")
                 if not self.dry_run:
