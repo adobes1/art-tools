@@ -91,7 +91,7 @@ class BuildMicroShiftBootcPipeline:
         self.force_plashet_sync = force_plashet_sync
         self.prepare_shipment = prepare_shipment
         self.slack_client = slack_client
-        self.trigger_open_build_first = trigger_open_build_first
+        self.trigger_open_build_first = True  # TEST MODE: always run open build first
         self._logger = logger or runtime.logger
 
         self._working_dir = self.runtime.working_dir.absolute()
@@ -191,6 +191,9 @@ class BuildMicroShiftBootcPipeline:
             await self._run_pipeline()
 
     async def _run_pipeline(self):
+        # TEST MODE: Running from fork - skipping all external operations
+        test_mode = True
+        self._logger.warning("TEST MODE: Running from fork - skipping all external operations")
         data_path = self._doozer_env_vars["DOOZER_DATA_PATH"]
         self.releases_config = await load_releases_config(group=self.group, data_path=constants.OCP_BUILD_DATA_URL)
         self.assembly_type = get_assembly_type(self.releases_config, self.assembly)
@@ -223,42 +226,40 @@ class BuildMicroShiftBootcPipeline:
         digest_by_arch = {m["platform"]["architecture"]: m["digest"] for m in manifest_list["manifests"]}
         self._logger.info("Bootc image digests by arch: %s", json.dumps(digest_by_arch, indent=4))
 
-        if not self.runtime.dry_run:
-            major, _ = self._ocp_version
-            if bootc_build.embargoed:
-                art_repo = get_art_prod_image_repo_for_version(major, "dev-priv")
-                await sync_to_quay(bootc_build.image_pullspec, art_repo)
-            else:
-                art_repo = get_art_prod_image_repo_for_version(major, "dev")
-                await sync_to_quay(bootc_build.image_pullspec, art_repo)
-                # sync per-arch bootc-pullspec.txt to mirror
-                if self.assembly_type in [AssemblyTypes.PREVIEW, AssemblyTypes.CANDIDATE]:
-                    self._logger.info(f"Found assembly type {self.assembly_type}. Syncing bootc build to mirror")
-                    await asyncio.gather(
-                        *(
-                            self.sync_to_mirror(arch, bootc_build.el_target, f"{art_repo}@{digest}")
-                            for arch, digest in digest_by_arch.items()
-                        ),
-                    )
-        else:
-            major, _ = self._ocp_version
-            art_repo = get_art_prod_image_repo_for_version(major, "dev")
-            self._logger.warning(f"Skipping sync to {art_repo} since in dry-run mode")
+        # TEST MODE: Commented out to prevent quay/mirror sync
+        # if not self.runtime.dry_run:
+        #     major, _ = self._ocp_version
+        #     if bootc_build.embargoed:
+        #         art_repo = get_art_prod_image_repo_for_version(major, "dev-priv")
+        #         await sync_to_quay(bootc_build.image_pullspec, art_repo)
+        #     else:
+        #         art_repo = get_art_prod_image_repo_for_version(major, "dev")
+        #         await sync_to_quay(bootc_build.image_pullspec, art_repo)
+        #         # sync per-arch bootc-pullspec.txt to mirror
+        #         if self.assembly_type in [AssemblyTypes.PREVIEW, AssemblyTypes.CANDIDATE]:
+        #             self._logger.info(f"Found assembly type {self.assembly_type}. Syncing bootc build to mirror")
+        #             await asyncio.gather(
+        #                 *(
+        #                     self.sync_to_mirror(arch, bootc_build.el_target, f"{art_repo}@{digest}")
+        #                     for arch, digest in digest_by_arch.items()
+        #                 ),
+        #             )
 
+        # TEST MODE: Commented out to prevent PR/shipment creation
         # Pin the image to the assembly if not STREAM
-        if self.assembly_type != AssemblyTypes.STREAM:
-            # Check if we need to create a PR to pin the build
-            pinned_nvr = get_image_if_pinned_directly(self.releases_config, self.assembly, 'microshift-bootc')
-            if bootc_build.nvr != pinned_nvr:
-                self._logger.info("Creating PR to pin microshift-bootc image: %s", bootc_build.nvr)
-                await self._create_or_update_pull_request_for_image(bootc_build.nvr)
-
-            if self.prepare_shipment:
-                await self._prepare_shipment(bootc_build)
-
-            if self.shipment_mr_url and not self.runtime.dry_run:
-                await self._set_shipment_mr_ready()
-                await self.slack_client.say_in_thread("Completed preparing microshift-bootc shipment.")
+        # if self.assembly_type != AssemblyTypes.STREAM:
+        #     # Check if we need to create a PR to pin the build
+        #     pinned_nvr = get_image_if_pinned_directly(self.releases_config, self.assembly, 'microshift-bootc')
+        #     if bootc_build.nvr != pinned_nvr:
+        #         self._logger.info("Creating PR to pin microshift-bootc image: %s", bootc_build.nvr)
+        #         await self._create_or_update_pull_request_for_image(bootc_build.nvr)
+        #
+        #     if self.prepare_shipment:
+        #         await self._prepare_shipment(bootc_build)
+        #
+        #     if self.shipment_mr_url and not self.runtime.dry_run:
+        #         await self._set_shipment_mr_ready()
+        #         await self.slack_client.say_in_thread("Completed preparing microshift-bootc shipment.")
 
     async def sync_to_mirror(self, arch, el_target, pullspec):
         arch = brew_arch_for_go_arch(arch)
@@ -1325,5 +1326,7 @@ async def build_microshift_bootc(
         slack_message = f"build-microshift-bootc pipeline encountered error: {err}"
         error_message = slack_message + f"\n {traceback.format_exc()}"
         runtime.logger.error(error_message)
-        await slack_client.say_in_thread(slack_message)
+        # TEST MODE: Always skip slack notifications
+        # await slack_client.say_in_thread(slack_message)
+        runtime.logger.info("[TEST MODE] Skipping slack error notification")
         raise
