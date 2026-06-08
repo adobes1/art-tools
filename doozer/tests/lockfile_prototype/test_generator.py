@@ -838,6 +838,41 @@ class TestRpmLockfilePrototypeGenerator(unittest.TestCase):
         result = generator._templatize_baseurl("https://example.com/content/repo/os/")
         self.assertEqual(result, "https://example.com/content/repo/os/")
 
+    def test_dockerfile_from_fallback_when_no_downstream_parents(self):
+        """
+        When downstream_parents is not provided (e.g. image config has no
+        'from:' key), the generator should parse the Dockerfile's FROM
+        lines and use those pullspecs for --image mode resolution.
+        """
+        meta = self._make_mock_image_meta()
+        meta.config.konflux.cachi2.lockfile.get.return_value = None
+        generator = self._make_generator()
+        # Simulate reachable base image: resolve_to_digest returns a digest
+        generator._container.resolve_to_digest = AsyncMock(
+            return_value="registry.redhat.io/rhel9/rhel-bootc@sha256:abc123"
+        )
+
+        captured_pullspecs: list[str | None] = []
+
+        async def capture_resolve(config, image_pullspec=None):
+            captured_pullspecs.append(image_pullspec)
+            return FAKE_LOCKFILE_DATA.model_copy(deep=True)
+
+        generator._resolver.resolve = AsyncMock(side_effect=capture_resolve)
+
+        with TemporaryDirectory() as tmpdir:
+            dest_dir = Path(tmpdir)
+            (dest_dir / "Dockerfile").write_text(
+                "FROM registry.redhat.io/rhel9/rhel-bootc:9.8\n"
+                "RUN dnf install -y firewalld microshift\n"
+            )
+            # No downstream_parents passed — generator should parse FROM
+            asyncio.run(generator.generate_lockfile(meta, dest_dir))
+
+        self.assertEqual(len(captured_pullspecs), 1)
+        # Should use --image mode with the resolved digest
+        self.assertEqual(captured_pullspecs[0], "registry.redhat.io/rhel9/rhel-bootc@sha256:abc123")
+
     def test_templatize_baseurl_already_has_basearch(self):
         generator = self._make_generator()
         result = generator._templatize_baseurl("https://example.com/baseos/$basearch/os/")

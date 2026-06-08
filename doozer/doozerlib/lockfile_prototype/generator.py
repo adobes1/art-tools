@@ -152,6 +152,15 @@ class RpmLockfilePrototypeGenerator:
             self.logger.warning(f"{image_meta.distgit_key}: no Dockerfile found, skipping")
             return
 
+        if not self.downstream_parents:
+            dfp = DockerfileParser(str(dockerfile_path))
+            if dfp.parent_images:
+                self.downstream_parents = list(dfp.parent_images)
+                self.logger.info(
+                    f"{image_meta.distgit_key}: no parent pullspecs provided, "
+                    f"using {len(self.downstream_parents)} FROM entries from Dockerfile"
+                )
+
         arches = image_meta.get_arches()
         repo_list = self._build_repo_list(enabled_repos, arches)
 
