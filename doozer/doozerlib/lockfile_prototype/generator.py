@@ -982,6 +982,14 @@ class RpmLockfilePrototypeGenerator:
         """
         upgrade_extras = reinstall if promote_reinstall_to_upgrade else []
         effective_upgrade = list(set(update_targets + upgrade_extras)) if image_pullspec else None
+
+        self.logger.debug("Building resolve config: arches=%s, %d repos, %d packages, %d reinstall, %d upgrade",
+                         arches, len(repo_list), len(packages), len(reinstall), len(effective_upgrade) if effective_upgrade else 0)
+        if packages:
+            self.logger.debug("Sample packages: %s", packages[:10])
+        if reinstall:
+            self.logger.debug("Sample reinstall: %s", reinstall[:10])
+
         return build_rpms_in_yaml(
             repo_list,
             arches,
@@ -1097,12 +1105,19 @@ class RpmLockfilePrototypeGenerator:
             try:
                 mode = "image" if resolver_pullspec else "bare"
                 total = len(remaining_packages) + sum(len(v) for v in arch_pkgs.values()) + len(remaining_reinstall)
-                self.logger.info(f"{distgit_key}: stage {stage_num}: resolving {total} packages in {mode} mode")
-                return await self._resolver.resolve(in_yaml, image_pullspec=resolver_pullspec)
+                self.logger.info(f"{distgit_key}: stage {stage_num}: resolving {total} packages in {mode} mode "
+                               f"(install={len(remaining_packages)}, arch_specific={sum(len(v) for v in arch_pkgs.values())}, "
+                               f"reinstall={len(remaining_reinstall)}, upgrade={len(remaining_update_targets)})")
+                result = await self._resolver.resolve(in_yaml, image_pullspec=resolver_pullspec)
+                self.logger.info(f"{distgit_key}: stage {stage_num}: resolution succeeded with {len(result.arches)} arches")
+                return result
             except RuntimeError as e:
+                self.logger.warning(f"{distgit_key}: stage {stage_num}: resolution failed: {str(e)[:200]}")
                 missing = RpmResolver.parse_missing_packages(str(e))
                 if not missing:
+                    self.logger.error(f"{distgit_key}: stage {stage_num}: resolution failed but no missing packages detected")
                     raise
+                self.logger.info(f"{distgit_key}: stage {stage_num}: detected {len(missing)} missing packages: {sorted(missing)}")
                 if strippable_packages is not None:
                     required_missing = missing - strippable_packages
                     if required_missing:
@@ -1112,6 +1127,8 @@ class RpmLockfilePrototypeGenerator:
                         )
                 reinstall_only = missing & set(remaining_reinstall)
                 fully_missing = missing - reinstall_only
+                self.logger.debug(f"{distgit_key}: stage {stage_num}: missing breakdown: "
+                                f"reinstall_only={sorted(reinstall_only)}, fully_missing={sorted(fully_missing)}")
                 removed = 0
                 if reinstall_only:
                     remaining_reinstall[:] = [p for p in remaining_reinstall if p not in reinstall_only]
@@ -1291,7 +1308,18 @@ class RpmLockfilePrototypeGenerator:
         else:
             final = merge_lockfiles(stage_lockfiles)
 
+        before_filter = len(final.arches)
+        arch_stats_before = [(a.arch, len(a.packages), len(a.source)) for a in final.arches]
         final.arches = [arch_entry for arch_entry in final.arches if arch_entry.packages or arch_entry.source]
+        after_filter = len(final.arches)
+
+        if before_filter != after_filter:
+            filtered_arches = [arch for arch, pkgs, src in arch_stats_before if pkgs == 0 and src == 0]
+            self.logger.warning(f"{image_meta.distgit_key}: filtered out {before_filter - after_filter} empty arches: {filtered_arches}")
+            self.logger.info(f"{image_meta.distgit_key}: arch stats before filter: {arch_stats_before}")
+
+        self.logger.info(f"{image_meta.distgit_key}: final lockfile has {after_filter} arches: "
+                        f"{[(a.arch, len(a.packages)) for a in final.arches]}")
 
         if image_meta.is_cross_arch_enabled():
             self._apply_cross_arch_merge(final)

@@ -87,6 +87,9 @@ class RpmResolver:
 
             in_file.write_text(yaml.safe_dump(config.model_dump(exclude_none=True), sort_keys=False))
 
+            # Log the input configuration for debugging
+            self.logger.debug("rpm-lockfile-prototype input config:\n%s", in_file.read_text())
+
             cmd = [SYSTEM_PYTHON, "-c", RPM_LOCKFILE_ENTRY_POINT]
             if image_pullspec:
                 cmd.extend(["--image", image_pullspec])
@@ -99,22 +102,59 @@ class RpmResolver:
             if self._xdg_cache_home:
                 env["XDG_CACHE_HOME"] = str(self._xdg_cache_home)
             env["TMPDIR"] = self._working_dir
-            rc, _, stderr = await cmd_gather_async(cmd, check=False, env=env)
+            self.logger.info("Calling rpm-lockfile-prototype with image=%s, arches=%s, packages=%s, reinstall=%s",
+                           image_pullspec or "bare",
+                           config.arches,
+                           len(config.packages) if config.packages else 0,
+                           len(config.reinstallPackages) if config.reinstallPackages else 0)
+            rc, stdout, stderr = await cmd_gather_async(cmd, check=False, env=env)
 
             if rc != 0:
+                self.logger.error("rpm-lockfile-prototype failed with exit code %d", rc)
+                self.logger.error("stderr:\n%s", stderr)
+                if stdout:
+                    self.logger.debug("stdout:\n%s", stdout)
                 if image_pullspec and self._is_rpmdb_corrupt(stderr):
                     self._clear_rpmdb_cache(image_pullspec)
                     self.logger.info("Retrying rpm-lockfile-prototype after RPMDB cache error")
-                    rc, _, stderr = await cmd_gather_async(cmd, check=False, env=env)
+                    rc, stdout, stderr = await cmd_gather_async(cmd, check=False, env=env)
                     if rc == 0:
-                        return LockfileData.model_validate(yaml.safe_load(out_file.read_text()))
+                        result = LockfileData.model_validate(yaml.safe_load(out_file.read_text()))
+                        self.logger.info("Retry succeeded, returned %d arches", len(result.arches))
+                        return result
                     error_summary = stderr.strip().rsplit("\n", 1)[-1]
                     self.logger.warning("Retry also failed (exit code %d): %s", rc, error_summary)
                     self.logger.debug("Full retry stderr:\n%s", stderr)
 
                 raise RuntimeError(f"rpm-lockfile-prototype failed (exit code {rc}): {stderr}")
 
-            return LockfileData.model_validate(yaml.safe_load(out_file.read_text()))
+            result = LockfileData.model_validate(yaml.safe_load(out_file.read_text()))
+            arch_details = [(a.arch, len(a.packages), len(a.source)) for a in result.arches]
+            self.logger.info("rpm-lockfile-prototype succeeded, returned %d arches: %s",
+                           len(result.arches),
+                           [f"{arch}({pkgs}p,{src}s)" for arch, pkgs, src in arch_details])
+
+            # Log stderr even on success to catch DNF warnings/errors
+            if stderr:
+                # Check for DNF-specific errors or arch-specific messages
+                stderr_lower = stderr.lower()
+                has_errors = any(x in stderr_lower for x in ['error', 'failed', 'exception', 'traceback'])
+                log_level = self.logger.warning if has_errors else self.logger.debug
+
+                log_level("rpm-lockfile-prototype stderr (exit 0):\n%s", stderr)
+
+                # Look for arch-specific DNF messages
+                for arch in ['x86_64', 'aarch64', 'ppc64le', 's390x']:
+                    if arch in stderr:
+                        self.logger.info("Found arch %s mentioned in stderr", arch)
+
+            # Log if any arches are empty
+            empty_arches = [arch for arch, pkgs, src in arch_details if pkgs == 0 and src == 0]
+            if empty_arches:
+                self.logger.warning("rpm-lockfile-prototype returned empty results for arches: %s", empty_arches)
+                self.logger.warning("This may indicate DNF errors for these arches - check stderr above")
+
+            return result
 
     @staticmethod
     def _is_rpmdb_corrupt(stderr: str) -> bool:
